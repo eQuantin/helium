@@ -1,0 +1,82 @@
+--- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
++++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+@@ -2320,6 +2320,9 @@ const PolicyToPreferenceMapEntry kSimplePolicyMap[] = {
+   { key::kBackgroundTabFreezingEnabled,
+     performance_manager::user_tuning::prefs::kTabFreezingEnabled,
+     base::Value::Type::BOOLEAN },
++  { key::kHeliumLayout,
++    prefs::kHeliumLayout,
++    base::Value::Type::INTEGER },
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   { key::kStrictMimetypeCheckForWorkerScriptsEnabled,
+     prefs::kStrictMimetypeCheckForWorkerScriptsEnabled,
+--- a/components/policy/resources/templates/policies.yaml
++++ b/components/policy/resources/templates/policies.yaml
+@@ -1488,6 +1488,7 @@ policies:
+   1487: DeviceMaxUserProfiles
+   1488: ""
+   1489: LaunchOnStartupEnabled
++  1490: HeliumLayout
+ 
+ atomic_groups:
+   1: Homepage
+--- /dev/null
++++ b/components/policy/resources/templates/policy_definitions/Miscellaneous/HeliumLayout.yaml
+@@ -0,0 +1,39 @@
++caption: Browser layout
++desc: |-
++  Sets the <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> browser layout: the classic horizontal tab strip, the compact layout, vertical tabs, or the dynamic layout.
++
++  If this policy is set, the layout is fixed and users can't change it.
++
++  If this policy is not set, users can pick the layout in settings.
++example_value: 2
++features:
++  dynamic_refresh: true
++  per_profile: true
++items:
++- caption: Classic layout
++  name: Classic
++  value: 0
++- caption: Compact layout
++  name: Compact
++  value: 1
++- caption: Vertical tabs
++  name: Vertical
++  value: 2
++- caption: Dynamic layout
++  name: Dynamic
++  value: 3
++owners:
++- file://components/policy/OWNERS
++schema:
++  enum:
++  - 0
++  - 1
++  - 2
++  - 3
++  type: integer
++supported_on:
++- chrome.linux:156-
++- chrome.win:156-
++- chrome.mac:156-
++tags: []
++type: int-enum
+--- /dev/null
++++ b/components/policy/test/data/pref_mapping/HeliumLayout.json
+@@ -0,0 +1,15 @@
++[
++  {
++    "os": ["win", "linux", "mac"],
++    "policy_pref_mapping_tests": [
++      {
++        "policies": { "HeliumLayout": 2 },
++        "prefs": { "helium.browser.layout": { "value": 2 } }
++      },
++      {
++        "policies": { "HeliumLayout": 0 },
++        "prefs": { "helium.browser.layout": { "value": 0 } }
++      }
++    ]
++  }
++]

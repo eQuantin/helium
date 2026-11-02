@@ -1,0 +1,300 @@
+--- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
++++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+@@ -2323,6 +2323,9 @@ const PolicyToPreferenceMapEntry kSimplePolicyMap[] = {
+   { key::kHeliumLayout,
+     prefs::kHeliumLayout,
+     base::Value::Type::INTEGER },
++  { key::kPinnedTabs,
++    prefs::kHeliumPolicyPinnedTabs,
++    base::Value::Type::LIST },
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   { key::kStrictMimetypeCheckForWorkerScriptsEnabled,
+     prefs::kStrictMimetypeCheckForWorkerScriptsEnabled,
+--- a/chrome/browser/ui/browser_window/internal/BUILD.gn
++++ b/chrome/browser/ui/browser_window/internal/BUILD.gn
+@@ -67,6 +67,8 @@ source_set("internal") {
+       "desktop_browser_window_capabilities.cc",
+       "embedder_browser_window_features.cc",
+       "global_browser_collection_platform_delegate_non_android.cc",
++      "pinned_tabs_policy_controller.cc",
++      "pinned_tabs_policy_controller.h",
+     ]
+     public_deps = [
+       "//chrome/browser:browser_public_dependencies",
+@@ -87,6 +89,7 @@ source_set("internal") {
+       "//chrome/browser/media/router:media_router_feature",
+       "//chrome/browser/prefs",
+       "//chrome/browser/skills:public",
++      "//chrome/browser/ui/navigator",
+       "//chrome/browser/tab_group_sync:factories",
+       "//chrome/browser/ttc/core",
+       "//chrome/browser/ui:browser_actions",
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -109,6 +109,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_api/tab_strip_service_feature.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
++#include "chrome/browser/ui/browser_window/internal/pinned_tabs_policy_controller.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_iph_controller.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller_impl.h"
+ #include "chrome/browser/ui/toasts/toast_features.h"
+@@ -1124,6 +1125,11 @@ void BrowserWindowFeatures::InitPostWindowConstruction(
+               *browser, browser);
+     }
+ 
++    if (!browser->GetProfile()->IsOffTheRecord()) {
++      pinned_tabs_policy_controller_ =
++          std::make_unique<PinnedTabsPolicyController>(browser);
++    }
++
+     if (base::FeatureList::IsEnabled(
+             feature_engagement::kIPHSendTabToSelfTutorialFeature)) {
+       send_tab_to_self_iph_controller_ =
+@@ -1163,6 +1169,7 @@ void BrowserWindowFeatures::TearDownPreBrowserWindowDestruction() {
+   // TYPE_NORMAL members.
+   send_tab_to_self_iph_controller_.reset();
+   vertical_tab_iph_controller_.reset();
++  pinned_tabs_policy_controller_.reset();
+   ttc_entrypoint_controller_.reset();
+   split_view_iph_controller_.reset();
+   split_tab_highlight_controller_.reset();
+--- /dev/null
++++ b/chrome/browser/ui/browser_window/internal/pinned_tabs_policy_controller.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/browser_window/internal/pinned_tabs_policy_controller.h"
++
++#include <set>
++#include <string>
++#include <string_view>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/string_util.h"
++#include "base/task/single_thread_task_runner.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++
++namespace {
++
++std::string NormalizedHost(const GURL& url) {
++  std::string_view host = url.host();
++  if (base::StartsWith(host, "www.")) {
++    host.remove_prefix(4);
++  }
++  return std::string(host);
++}
++
++}  // namespace
++
++PinnedTabsPolicyController::PinnedTabsPolicyController(
++    BrowserWindowInterface* browser)
++    : browser_(browser) {
++  pref_change_registrar_.Init(browser_->GetProfile()->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kHeliumPolicyPinnedTabs,
++      base::BindRepeating(&PinnedTabsPolicyController::ScheduleApply,
++                          base::Unretained(this)));
++  // The window is created before its initial tabs (startup URLs, session
++  // restore, a dragged-out tab) are added; check once they are in.
++  ScheduleApply();
++}
++
++PinnedTabsPolicyController::~PinnedTabsPolicyController() = default;
++
++void PinnedTabsPolicyController::ScheduleApply() {
++  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&PinnedTabsPolicyController::Apply,
++                                weak_ptr_factory_.GetWeakPtr()));
++}
++
++void PinnedTabsPolicyController::Apply() {
++  if (browser_->IsDeleteScheduled()) {
++    return;
++  }
++  const base::ListValue& urls =
++      browser_->GetProfile()->GetPrefs()->GetList(
++          prefs::kHeliumPolicyPinnedTabs);
++  if (urls.empty()) {
++    return;
++  }
++
++  TabStripModel* tab_strip_model = browser_->GetTabStripModel();
++  std::set<std::string> present;
++  for (int i = 0; i < tab_strip_model->IndexOfFirstNonPinnedTab(); ++i) {
++    present.insert(
++        NormalizedHost(tab_strip_model->GetWebContentsAt(i)->GetVisibleURL()));
++  }
++
++  for (const base::Value& value : urls) {
++    if (!value.is_string()) {
++      continue;
++    }
++    GURL url(value.GetString());
++    if (!url.is_valid()) {
++      continue;
++    }
++    if (!present.insert(NormalizedHost(url)).second) {
++      continue;
++    }
++    NavigateParams params(browser_.get(), url,
++                          ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++    params.disposition = WindowOpenDisposition::NEW_BACKGROUND_TAB;
++    params.tabstrip_index = tab_strip_model->IndexOfFirstNonPinnedTab();
++    params.tabstrip_add_types =
++        AddTabTypes::ADD_PINNED | AddTabTypes::ADD_FORCE_INDEX;
++    Navigate(&params);
++  }
++}
+--- /dev/null
++++ b/chrome/browser/ui/browser_window/internal/pinned_tabs_policy_controller.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_BROWSER_WINDOW_INTERNAL_PINNED_TABS_POLICY_CONTROLLER_H_
++#define CHROME_BROWSER_UI_BROWSER_WINDOW_INTERNAL_PINNED_TABS_POLICY_CONTROLLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class BrowserWindowInterface;
++
++// Keeps the URLs of the PinnedTabs policy open as pinned tabs in a normal
++// browser window. A URL counts as present when a pinned tab with the same
++// host (ignoring a leading "www.") exists, so navigating inside a pinned tab
++// doesn't spawn a duplicate. Missing URLs are appended to the pinned group,
++// in policy order, once the window's initial tabs (e.g. session restore) are
++// in, and again whenever the policy changes.
++class PinnedTabsPolicyController {
++ public:
++  explicit PinnedTabsPolicyController(BrowserWindowInterface* browser);
++  ~PinnedTabsPolicyController();
++
++  PinnedTabsPolicyController(const PinnedTabsPolicyController&) = delete;
++  PinnedTabsPolicyController& operator=(const PinnedTabsPolicyController&) =
++      delete;
++
++ private:
++  void ScheduleApply();
++  void Apply();
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::WeakPtrFactory<PinnedTabsPolicyController> weak_ptr_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_UI_BROWSER_WINDOW_INTERNAL_PINNED_TABS_POLICY_CONTROLLER_H_
+--- a/chrome/browser/ui/browser_window/public/browser_window_features.h
++++ b/chrome/browser/ui/browser_window/public/browser_window_features.h
+@@ -118,6 +118,7 @@ class UIControllerFactory;
+ class UnloadController;
+ class UpgradeNotificationController;
+ class VerticalTabIphController;
++class PinnedTabsPolicyController;
+ class WebUIBrowserExclusiveAccessContext;
+ class WebUIBrowserSidePanelUI;
+ class WindowFeatureController;
+@@ -468,6 +469,7 @@ class BrowserWindowFeatures {
+   std::unique_ptr<send_tab_to_self::SendTabToSelfIphController>
+       send_tab_to_self_iph_controller_;
+   std::unique_ptr<VerticalTabIphController> vertical_tab_iph_controller_;
++  std::unique_ptr<PinnedTabsPolicyController> pinned_tabs_policy_controller_;
+   std::unique_ptr<HeliumLayoutStateController> helium_layout_state_controller_;
+ 
+   std::unique_ptr<tabs::VerticalTabStripStateController>
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -35,6 +35,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterIntegerPref(prefs::kHeliumLayout,
+                                 std::to_underlying(HeliumLayoutType::kClassic));
+   registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
++  registry->RegisterListPref(prefs::kHeliumPolicyPinnedTabs);
+   registry->RegisterBooleanPref(prefs::kHeliumZenMode, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeSidebarPinned, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeTopChromePinned, false);
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -634,6 +634,10 @@ inline constexpr char kHeliumLayout[] = "helium.browser.layout";
+ inline constexpr char kHeliumVerticalRightAligned[] =
+     "helium.browser.vertical_right_aligned";
+ 
++// A list of URLs (set by the PinnedTabs policy) kept open as pinned tabs at
++// the start of every normal browser window.
++inline constexpr char kHeliumPolicyPinnedTabs[] = "helium.policy_pinned_tabs";
++
+ // A boolean pref set to true if zen mode is enabled.
+ inline constexpr char kHeliumZenMode[] = "helium.browser.zen_mode";
+ 
+--- a/components/policy/resources/templates/policies.yaml
++++ b/components/policy/resources/templates/policies.yaml
+@@ -1489,6 +1489,7 @@ policies:
+   1488: ""
+   1489: LaunchOnStartupEnabled
+   1490: HeliumLayout
++  1491: PinnedTabs
+ 
+ atomic_groups:
+   1: Homepage
+--- /dev/null
++++ b/components/policy/resources/templates/policy_definitions/Miscellaneous/PinnedTabs.yaml
+@@ -0,0 +1,27 @@
++caption: Pinned tabs
++desc: |-
++  Keeps a list of URLs open as pinned tabs in every <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> window.
++
++  When a window opens, and whenever this policy changes, each URL without a pinned tab of the same host (ignoring a leading "www.") is opened as a pinned tab, after the existing pinned tabs. Navigating inside such a tab doesn't open a duplicate. Users can still close or unpin these tabs; they come back in the next window.
++
++  Incognito and guest windows are not affected.
++
++  If this policy is not set, no tabs are pinned automatically.
++example_value:
++- https://www.youtube.com/
++- https://www.twitch.tv/
++features:
++  dynamic_refresh: true
++  per_profile: true
++owners:
++- file://components/policy/OWNERS
++schema:
++  items:
++    type: string
++  type: array
++supported_on:
++- chrome.linux:156-
++- chrome.win:156-
++- chrome.mac:156-
++tags: []
++type: list
+--- /dev/null
++++ b/components/policy/test/data/pref_mapping/PinnedTabs.json
+@@ -0,0 +1,13 @@
++[
++  {
++    "os": ["win", "linux", "mac"],
++    "policy_pref_mapping_tests": [
++      {
++        "policies": { "PinnedTabs": ["https://www.youtube.com/"] },
++        "prefs": {
++          "helium.policy_pinned_tabs": { "value": ["https://www.youtube.com/"] }
++        }
++      }
++    ]
++  }
++]
