@@ -1,0 +1,199 @@
+--- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
++++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+@@ -2326,6 +2326,9 @@ const PolicyToPreferenceMapEntry kSimplePolicyMap[] = {
+   { key::kPinnedTabs,
+     prefs::kHeliumPolicyPinnedTabs,
+     base::Value::Type::LIST },
++  { key::kHeliumPinnedTabColumns,
++    prefs::kHeliumPinnedTabColumns,
++    base::Value::Type::INTEGER },
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   { key::kStrictMimetypeCheckForWorkerScriptsEnabled,
+     prefs::kStrictMimetypeCheckForWorkerScriptsEnabled,
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -36,6 +36,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+                                 std::to_underlying(HeliumLayoutType::kClassic));
+   registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
+   registry->RegisterListPref(prefs::kHeliumPolicyPinnedTabs);
++  registry->RegisterIntegerPref(prefs::kHeliumPinnedTabColumns, 0);
+   registry->RegisterBooleanPref(prefs::kHeliumZenMode, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeSidebarPinned, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeTopChromePinned, false);
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -4,10 +4,16 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ 
++#include <algorithm>
++
++#include "base/functional/bind.h"
+ #include "base/i18n/rtl.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -15,6 +21,8 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -73,11 +81,33 @@ PinnedTabContainerView::PinnedTabContainerView(
+               &PinnedTabContainerView::OnCollapseStateChanged,
+               base::Unretained(this)));
+     }
++
++    // Helium: the HeliumPinnedTabColumns policy caps the pinned grid width.
++    BrowserView* browser_view =
++        collection_node_->GetController()->GetBrowserView();
++    Profile* profile = browser_view && browser_view->browser()
++                           ? browser_view->browser()->GetProfile()
++                           : nullptr;
++    if (PrefService* prefs = profile ? profile->GetPrefs() : nullptr) {
++      pref_change_registrar_.Init(prefs);
++      pref_change_registrar_.Add(
++          prefs::kHeliumPinnedTabColumns,
++          base::BindRepeating(&PinnedTabContainerView::UpdateMaxColumns,
++                              base::Unretained(this)));
++      UpdateMaxColumns();
++    }
+   }
+ }
+ 
+ PinnedTabContainerView::~PinnedTabContainerView() = default;
+ 
++void PinnedTabContainerView::UpdateMaxColumns() {
++  max_columns_ = std::max(
++      0, pref_change_registrar_.prefs()->GetInteger(
++             prefs::kHeliumPinnedTabColumns));
++  InvalidateLayout();
++}
++
+ views::ProposedLayout PinnedTabContainerView::CalculateProposedLayout(
+     const views::SizeBounds& size_bounds) const {
+   if (collection_node_ &&
+@@ -293,6 +323,7 @@ PinnedTabContainerView::GetLinkDropIndexForExpanded(
+ void PinnedTabContainerView::ResetCollectionNode() {
+   collapsed_state_changed_subscription_ = {};
+   collection_node_ = nullptr;
++  pref_change_registrar_.Reset();
+ }
+ 
+ void PinnedTabContainerView::OnCollapseStateChanged(
+@@ -423,6 +454,9 @@ views::ProposedLayout PinnedTabContainerView::CalculateVerticalLayout(
+                   static_cast<int>(std::floor((available_width - child_width) /
+                                               (child_width + kTabPadding)) +
+                                    1));
++    if (max_columns_ > 0) {
++      children_on_row = std::min(children_on_row, max_columns_);
++    }
+ 
+     // Allocate extra space to the tabs.
+     available_width -=
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_z_order_manager.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/layout/delegating_layout_manager.h"
+ #include "ui/views/view.h"
+@@ -80,11 +81,18 @@ class PinnedTabContainerView
+   void ResetCollectionNode();
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
++  // Helium: re-reads prefs::kHeliumPinnedTabColumns into max_columns_.
++  void UpdateMaxColumns();
++
+   raw_ptr<TabCollectionNode> collection_node_;
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+   base::CallbackListSubscription collapsed_state_changed_subscription_;
++
++  // Helium: cap on pinned tabs per row while expanded (0 = no cap).
++  int max_columns_ = 0;
++  PrefChangeRegistrar pref_change_registrar_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -638,6 +638,11 @@ inline constexpr char kHeliumVerticalRightAligned[] =
+ // the start of every normal browser window.
+ inline constexpr char kHeliumPolicyPinnedTabs[] = "helium.policy_pinned_tabs";
+ 
++// An integer pref (set by the HeliumPinnedTabColumns policy) capping how many
++// pinned tabs share a row in the expanded vertical tab strip; 0 = no cap.
++inline constexpr char kHeliumPinnedTabColumns[] =
++    "helium.browser.pinned_tab_columns";
++
+ // A boolean pref set to true if zen mode is enabled.
+ inline constexpr char kHeliumZenMode[] = "helium.browser.zen_mode";
+ 
+--- a/components/policy/resources/templates/policies.yaml
++++ b/components/policy/resources/templates/policies.yaml
+@@ -1490,6 +1490,7 @@ policies:
+   1489: LaunchOnStartupEnabled
+   1490: HeliumLayout
+   1491: PinnedTabs
++  1492: HeliumPinnedTabColumns
+ 
+ atomic_groups:
+   1: Homepage
+--- /dev/null
++++ b/components/policy/resources/templates/policy_definitions/Miscellaneous/HeliumPinnedTabColumns.yaml
+@@ -0,0 +1,23 @@
++caption: Pinned tab columns
++desc: |-
++  Sets the maximum number of pinned tabs shown side by side in each row of the <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> vertical tab strip while it is expanded. The tabs in a row share the full width of the tab strip.
++
++  If this policy is set to 0 or not set, as many pinned tabs as fit the tab strip width are shown on each row.
++
++  The collapsed vertical tab strip always shows one pinned tab per row, and the horizontal tab strip is not affected.
++example_value: 2
++features:
++  dynamic_refresh: true
++  per_profile: true
++owners:
++- file://components/policy/OWNERS
++schema:
++  maximum: 10
++  minimum: 0
++  type: integer
++supported_on:
++- chrome.linux:156-
++- chrome.win:156-
++- chrome.mac:156-
++tags: []
++type: int
+--- /dev/null
++++ b/components/policy/test/data/pref_mapping/HeliumPinnedTabColumns.json
+@@ -0,0 +1,15 @@
++[
++  {
++    "os": ["win", "linux", "mac"],
++    "policy_pref_mapping_tests": [
++      {
++        "policies": { "HeliumPinnedTabColumns": 2 },
++        "prefs": { "helium.browser.pinned_tab_columns": { "value": 2 } }
++      },
++      {
++        "policies": { "HeliumPinnedTabColumns": 0 },
++        "prefs": { "helium.browser.pinned_tab_columns": { "value": 0 } }
++      }
++    ]
++  }
++]
