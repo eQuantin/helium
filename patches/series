@@ -368,3 +368,4 @@ helium/ui/exclusive-access-bubble.patch
 helium/ui/hide-page-actions-flag.patch
 nix/helium-layout-policy.patch
 nix/pinned-tabs-policy.patch
+nix/pinned-tab-columns-policy.patch
