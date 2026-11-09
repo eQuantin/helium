@@ -244,11 +244,11 @@
  
 --- a/components/policy/resources/templates/policies.yaml
 +++ b/components/policy/resources/templates/policies.yaml
-@@ -1489,6 +1489,7 @@ policies:
-   1488: ""
-   1489: LaunchOnStartupEnabled
-   1490: HeliumLayout
-+  1491: PinnedTabs
+@@ -1496,6 +1496,7 @@ policies:
+   1495: ManagedClientCertificateForUserConfig
+   1496: GeminiEnterpriseUrl
+   1497: HeliumLayout
++  1498: PinnedTabs
  
  atomic_groups:
    1: Homepage
