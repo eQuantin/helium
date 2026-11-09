@@ -22,7 +22,7 @@
    registry->RegisterBooleanPref(prefs::kHeliumZenModeTopChromePinned, false);
 --- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
-@@ -4,10 +4,16 @@
+@@ -4,9 +4,15 @@
  
  #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
  
@@ -33,13 +33,12 @@
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/layout_constants.h"
- #include "chrome/browser/ui/tabs/features.h"
  #include "chrome/browser/ui/tabs/tab_style.h"
 +#include "chrome/browser/ui/views/frame/browser_view.h"
  #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
  #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
-@@ -15,6 +21,8 @@
+@@ -14,6 +20,8 @@
  #include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
  #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
  #include "chrome/browser/ui/views/tabs/common/tab_view.h"
@@ -48,7 +47,7 @@
  #include "content/public/browser/navigation_controller.h"
  #include "ui/base/metadata/metadata_impl_macros.h"
  #include "ui/gfx/geometry/rect.h"
-@@ -73,11 +81,33 @@ PinnedTabContainerView::PinnedTabContainerView(
+@@ -74,11 +82,33 @@
                &PinnedTabContainerView::OnCollapseStateChanged,
                base::Unretained(this)));
      }
@@ -81,8 +80,8 @@
 +
  views::ProposedLayout PinnedTabContainerView::CalculateProposedLayout(
      const views::SizeBounds& size_bounds) const {
-   if (collection_node_ &&
-@@ -293,6 +323,7 @@ PinnedTabContainerView::GetLinkDropIndexForExpanded(
+   if (orientation_ == TabStripOrientation::kHorizontal) {
+@@ -291,6 +321,7 @@
  void PinnedTabContainerView::ResetCollectionNode() {
    collapsed_state_changed_subscription_ = {};
    collection_node_ = nullptr;
@@ -90,7 +89,7 @@
  }
  
  void PinnedTabContainerView::OnCollapseStateChanged(
-@@ -423,6 +454,9 @@ views::ProposedLayout PinnedTabContainerView::CalculateVerticalLayout(
+@@ -418,6 +449,9 @@
                    static_cast<int>(std::floor((available_width - child_width) /
                                                (child_width + kTabPadding)) +
                                     1));
@@ -102,22 +101,23 @@
      available_width -=
 --- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
 +++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
-@@ -10,6 +10,7 @@
- #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+@@ -11,6 +11,7 @@
  #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_z_order_manager.h"
+ #include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
 +#include "components/prefs/pref_change_registrar.h"
  #include "ui/base/metadata/metadata_header_macros.h"
  #include "ui/views/layout/delegating_layout_manager.h"
  #include "ui/views/view.h"
-@@ -80,11 +81,18 @@ class PinnedTabContainerView
+@@ -81,12 +82,19 @@
    void ResetCollectionNode();
    void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
  
 +  // Helium: re-reads prefs::kHeliumPinnedTabColumns into max_columns_.
 +  void UpdateMaxColumns();
 +
-   raw_ptr<TabCollectionNode> collection_node_;
+   const TabStripOrientation orientation_;
+   raw_ptr<TabCollectionNode> collection_node_ = nullptr;
    const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
  
    base::CallbackListSubscription node_destroyed_subscription_;
