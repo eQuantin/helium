@@ -1,6 +1,6 @@
 --- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
 +++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
-@@ -2320,6 +2320,9 @@ const PolicyToPreferenceMapEntry kSimplePolicyMap[] = {
+@@ -2324,6 +2324,9 @@ const PolicyToPreferenceMapEntry kSimplePolicyMap[] = {
    { key::kBackgroundTabFreezingEnabled,
      performance_manager::user_tuning::prefs::kTabFreezingEnabled,
      base::Value::Type::BOOLEAN },
