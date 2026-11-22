@@ -1,0 +1,557 @@
+--- a/chrome/browser/policy/configuration_policy_handler_list_factory.cc
++++ b/chrome/browser/policy/configuration_policy_handler_list_factory.cc
+@@ -2333,6 +2333,9 @@ const PolicyToPreferenceMapEntry kSimplePolicyMap[] = {
+   { key::kHeliumPinnedTabColumns,
+     prefs::kHeliumPinnedTabColumns,
+     base::Value::Type::INTEGER },
++  { key::kPinnedTabsLocked,
++    prefs::kHeliumPolicyPinnedTabsLocked,
++    base::Value::Type::BOOLEAN },
+ #endif  // BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+   { key::kStrictMimetypeCheckForWorkerScriptsEnabled,
+     prefs::kStrictMimetypeCheckForWorkerScriptsEnabled,
+--- a/chrome/browser/ui/tabs/helium_pins_service.cc
++++ b/chrome/browser/ui/tabs/helium_pins_service.cc
+@@ -228,6 +228,10 @@ HeliumPinsService::HeliumPinsService(Profile* profile,
+         prefs::kHeliumPolicyPinnedTabs,
+         base::BindRepeating(&HeliumPinsService::ApplyPolicyPins,
+                             base::Unretained(this)));
++    policy_registrar_.Add(
++        prefs::kHeliumPolicyPinnedTabsLocked,
++        base::BindRepeating(&HeliumPinsService::ApplyPolicyPins,
++                            base::Unretained(this)));
+     ApplyPolicyPins();
+   }
+ }
+@@ -240,6 +244,7 @@ void HeliumPinsService::UnpinAll() {
+ 
+   {
+     base::AutoReset<bool> applying_changes(&applying_changes_, true);
++    TabStripModel::ScopedPinnedTabsUnlock unlock;
+     for (BrowserWindowInterface* browser : GetSyncedBrowsers()) {
+       UnpinCopies(GetPinnedTabControllers(browser));
+     }
+@@ -278,6 +283,7 @@ void HeliumPinsService::OnBrowserCreated(BrowserWindowInterface* browser) {
+   }
+ 
+   browser->GetTabStripModel()->AddObserver(this);
++  browser->GetTabStripModel()->SetPinnedTabsLocked(locked_);
+   unreconciled_browsers_.push_back(browser->GetWeakPtr());
+ 
+   // Deferred, so that pins opened by startup or session restore are matched
+@@ -483,6 +489,12 @@ void HeliumPinsService::OnSplitTabChanged(const SplitTabChange& change) {
+       break;
+   }
+ 
++  // Helium: the splits of locked pins stay as the pin list has them.
++  if (locked_) {
++    ScheduleReconcile(browser);
++    return;
++  }
++
+   if (UpdateSplits(browser)) {
+     SavePins();
+     ScheduleReconcileOthers(browser);
+@@ -541,6 +553,12 @@ void HeliumPinsService::AddPin(BrowserWindowInterface* browser,
+     return;
+   }
+ 
++  // Helium: while locked, a newly pinned tab is unpinned again.
++  if (locked_) {
++    ScheduleReconcile(browser);
++    return;
++  }
++
+   InsertNewPin(browser, controller);
+ 
+   // Splits are pinned as a whole.
+@@ -558,6 +576,13 @@ void HeliumPinsService::RemovePin(tabs::TabInterface* tab) {
+ 
+   const std::string id = controller->pin_id();
+   controller->ClearPin();
++
++  // Helium: while locked, the pin stays and its window gets a copy back.
++  if (locked_) {
++    ScheduleReconcile(tab->GetBrowserWindowInterface());
++    return;
++  }
++
+   UnpinEverywhere(id, tab->GetBrowserWindowInterface());
+ }
+ 
+@@ -568,10 +593,17 @@ void HeliumPinsService::UnpinEverywhere(const std::string& id,
+     return;
+   }
+ 
++  // Helium: locked pins stay; windows that lost their copy get it back.
++  if (locked_) {
++    ScheduleReconcileOthers(nullptr);
++    return;
++  }
++
+   pins_.erase(it);
+   SavePins();
+ 
+   base::AutoReset<bool> applying_changes(&applying_changes_, true);
++  TabStripModel::ScopedPinnedTabsUnlock unlock;
+   for (HeliumPinsTabController* copy : GetPinCopies(id)) {
+     // The tab strip of source may still be notifying its observers, so its
+     // copies are unpinned by a Reconcile() instead.
+@@ -631,6 +663,7 @@ void HeliumPinsService::HandleDetachedPins() {
+ 
+   {
+     base::AutoReset<bool> applying_changes(&applying_changes_, true);
++    TabStripModel::ScopedPinnedTabsUnlock unlock;
+     for (auto& [target, copies] : to_unpin) {
+       UnpinCopies(std::move(copies));
+     }
+@@ -706,6 +739,12 @@ void HeliumPinsService::CloseWindowsEmptiedByDrags() {
+ }
+ 
+ void HeliumPinsService::ReorderPins(BrowserWindowInterface* browser) {
++  // Helium: locked pins keep the policy order.
++  if (locked_) {
++    ScheduleReconcile(browser);
++    return;
++  }
++
+   // Positions in the pin list of the pins in browser, and their new order.
+   std::vector<size_t> positions;
+   std::vector<Pin> reordered;
+@@ -843,7 +882,9 @@ void HeliumPinsService::Reconcile(BrowserWindowInterface* browser) {
+                   return !other || other.get() == browser;
+                 });
+   base::AutoReset<bool> applying_changes(&applying_changes_, true);
++  TabStripModel::ScopedPinnedTabsUnlock unlock;
+   TabStripModel* const model = browser->GetTabStripModel();
++  model->SetPinnedTabsLocked(locked_);
+   bool pins_changed = false;
+ 
+   // Sort the pinned tabs of the window by their pin list entry.
+@@ -899,6 +940,9 @@ void HeliumPinsService::Reconcile(BrowserWindowInterface* browser) {
+ 
+       // Pins opened at startup only have their URL.
+       RequestHibernatedTitle(&controller->tab(), match->url);
++    } else if (locked_) {
++      // Helium: while locked, only the policy pins stay pinned.
++      to_unpin.push_back(controller);
+     } else {
+       present[InsertNewPin(browser, controller)] = controller;
+       pins_changed = true;
+@@ -907,7 +951,7 @@ void HeliumPinsService::Reconcile(BrowserWindowInterface* browser) {
+ 
+   // Sessions saved before pins had ids restore pinned splits that the pin
+   // list doesn't have yet.
+-  if (ImportLegacySplits(browser, unidentified)) {
++  if (!locked_ && ImportLegacySplits(browser, unidentified)) {
+     pins_changed = true;
+   }
+ 
+@@ -1205,6 +1249,17 @@ void HeliumPinsService::ApplyPolicyPins() {
+     return;
+   }
+ 
++  locked_ =
++      prefs_ && prefs_->GetBoolean(prefs::kHeliumPolicyPinnedTabsLocked);
++  for (BrowserWindowInterface* browser : GetSyncedBrowsers()) {
++    browser->GetTabStripModel()->SetPinnedTabsLocked(locked_);
++  }
++
++  if (locked_) {
++    ApplyLockedPolicyPins();
++    return;
++  }
++
+   std::set<std::string> present;
+   for (const Pin& pin : pins_) {
+     present.insert(GetPolicyPinKey(pin.url));
+@@ -1225,4 +1280,43 @@ void HeliumPinsService::ApplyPolicyPins() {
+   }
+ }
+ 
++void HeliumPinsService::ApplyLockedPolicyPins() {
++  // Each policy URL keeps the first pin with its key, or gets a new one.
++  PinList locked_pins;
++  for (const GURL& url : GetPolicyPinUrls()) {
++    const std::string key = GetPolicyPinKey(url);
++    const auto it = std::ranges::find_if(pins_, [&key](const Pin& pin) {
++      return GetPolicyPinKey(pin.url) == key;
++    });
++    locked_pins.insert(locked_pins.end(),
++                       it != pins_.end() ? *it : Pin{CreatePinId(), url});
++  }
++
++  // Splits only stay between pins that are still next to each other.
++  for (size_t i = 0; i < locked_pins.size(); ++i) {
++    Pin& pin = locked_pins[i];
++    if (pin.split.empty()) {
++      continue;
++    }
++
++    const bool is_first = pin.split == pin.id && i + 1 < locked_pins.size() &&
++                          locked_pins[i + 1].split == pin.id;
++    const bool is_second = i > 0 && locked_pins[i - 1].id == pin.split &&
++                           locked_pins[i - 1].split == pin.split;
++    if (!is_first && !is_second) {
++      pin.split.clear();
++      pin.split_visual_data = split_tabs::SplitTabVisualData();
++    }
++  }
++
++  if (locked_pins.ToPref() != pins_.ToPref()) {
++    pins_ = std::move(locked_pins);
++    SavePins();
++  }
++
++  // Windows unpin the pins that were dropped, add the missing ones and take
++  // the policy order.
++  ScheduleReconcileOthers(nullptr);
++}
++
+ }  // namespace helium_pins
+--- a/chrome/browser/ui/tabs/helium_pins_service.h
++++ b/chrome/browser/ui/tabs/helium_pins_service.h
+@@ -169,10 +169,14 @@ class HeliumPinsService : public KeyedService,
+ 
+   // Helium: adds a pin, after the others, for every policy URL that no pin
+   // has the key of. Called when the service starts, after UnpinAll() and
+-  // whenever the policy changes, so a policy pin the user unpinned comes back
+-  // then.
++  // whenever the policies change, so a policy pin the user unpinned comes back
++  // then. With PinnedTabsLocked, the pin list becomes exactly the policy pins,
++  // in policy order, and the tab strips of synced windows are locked.
+   void ApplyPolicyPins();
+ 
++  // Helium: makes the pin list the policy pins, see ApplyPolicyPins().
++  void ApplyLockedPolicyPins();
++
+   const raw_ptr<Profile> profile_;
+   const raw_ptr<PrefService> prefs_;
+   const raw_ptr<history::HistoryService> history_;
+@@ -218,6 +222,11 @@ class HeliumPinsService : public KeyedService,
+   // Helium: watches the pin policies.
+   PrefChangeRegistrar policy_registrar_;
+ 
++  // Helium: whether the PinnedTabsLocked policy freezes the pin list. While
++  // it does, user changes to pins that get past the tab strip's lock are
++  // undone by reconciling instead of being taken into the pin list.
++  bool locked_ = false;
++
+   base::WeakPtrFactory<HeliumPinsService> weak_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/tabs/helium_pins_util.cc
++++ b/chrome/browser/ui/tabs/helium_pins_util.cc
+@@ -456,6 +456,12 @@ bool CanUseCurrentUrlAsPinnedUrl(tabs::TabInterface* tab) {
+     return false;
+   }
+ 
++  // Helium: frozen pins (PinnedTabsLocked policy) keep their pinned URL.
++  if (tab->GetBrowserWindowInterface()->GetTabStripModel()->IsPinnedTabFrozen(
++          tab)) {
++    return false;
++  }
++
+   const GURL url = GetPinnableUrl(tab->GetContents());
+   return url.is_valid() && url != controller->pinned_url();
+ }
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -1117,6 +1117,9 @@ int TabStripModel::MoveWebContentsAt(int index,
+ 
+   CHECK(ContainsIndex(index));
+   const bool pinned = IsTabPinned(index);
++  if (pinned && ArePinnedTabsFrozen()) {
++    return index;
++  }
+ 
+   to_position = ConstrainMoveIndex(to_position, pinned);
+ 
+@@ -1141,6 +1144,9 @@ int TabStripModel::MoveWebContentsAt(
+   CHECK(ContainsIndex(index));
+ 
+   bool pinned = IsTabPinned(index);
++  if (pinned && ArePinnedTabsFrozen()) {
++    return index;
++  }
+   to_position = ConstrainMoveIndex(to_position, pinned);
+   MoveTabToIndexImpl(index, to_position, group, pinned, select_after_move);
+   return to_position;
+@@ -1160,10 +1166,13 @@ void TabStripModel::MoveSelectedTabsTo(
+                  static_cast<int>(pinned_selected_indices.size()) - 1,
+                  pinned_tab_count - 1);
+ 
+-  MoveTabsToIndexImpl(
+-      pinned_selected_indices,
+-      last_pinned_index - static_cast<int>(pinned_selected_indices.size()) + 1,
+-      std::nullopt);
++  if (!ArePinnedTabsFrozen()) {
++    MoveTabsToIndexImpl(
++        pinned_selected_indices,
++        last_pinned_index - static_cast<int>(pinned_selected_indices.size()) +
++            1,
++        std::nullopt);
++  }
+ 
+   const int first_unpinned_index =
+       std::clamp(index + static_cast<int>(pinned_selected_indices.size()),
+@@ -1216,6 +1225,11 @@ void TabStripModel::MoveSplitTo(
+     return;
+   }
+ 
++  if (ArePinnedTabsFrozen() &&
++      (pinned || GetSplitData(split_id)->ListTabs().front()->IsPinned())) {
++    return;
++  }
++
+   to_index = ConstrainMoveIndex(to_index, pinned);
+ 
+   std::vector<std::pair<tabs::TabInterface*, int>> tabs_with_indices =
+@@ -1524,7 +1538,7 @@ int TabStripModel::SetTabPinned(int index, bool pinned) {
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+   CHECK(ContainsIndex(index));
+ 
+-  if (IsTabPinned(index) == pinned) {
++  if (IsTabPinned(index) == pinned || ArePinnedTabsFrozen()) {
+     return index;
+   }
+ 
+@@ -2852,7 +2866,7 @@ bool TabStripModel::IsContextMenuCommandEnabled(
+     }
+ 
+     case CommandTogglePinned:
+-      return true;
++      return !ArePinnedTabsFrozen();
+ 
+     case CommandToggleGrouped:
+       return SupportsTabGroups();
+@@ -2870,6 +2884,8 @@ bool TabStripModel::IsContextMenuCommandEnabled(
+ 
+     case CommandAddToSplit:
+     case CommandSwapWithActiveSplit:
++      return !CommandTouchesFrozenPinnedTab(context_index);
++
+     case CommandArrangeSplit:
+       return true;
+ 
+@@ -2905,9 +2921,12 @@ bool TabStripModel::IsContextMenuCommandEnabled(
+     }
+ 
+     case CommandMoveToExistingWindow:
+-      return true;
++      return !CommandTouchesFrozenPinnedTab(context_index);
+ 
+     case CommandMoveTabsToNewWindow: {
++      if (CommandTouchesFrozenPinnedTab(context_index)) {
++        return false;
++      }
+       std::vector<int> indices = GetIndicesForCommand(context_index);
+       const bool would_leave_strip_empty =
+           static_cast<int>(indices.size()) == count();
+@@ -4734,6 +4753,9 @@ void TabStripModel::MoveTabRelative(TabRelativeDirection direction) {
+   CHECK(active_index() != kNoTab);
+   const size_t active_tab_index = static_cast<size_t>(active_index());
+   tabs::TabInterface* active_tab = GetTabAtIndex(active_tab_index);
++  if (IsPinnedTabFrozen(active_tab)) {
++    return;
++  }
+ 
+   // The range of indices being moved. This will either be the active tab, or
+   // all the tabs in the same split as the active tab. These are guaranteed to
+@@ -5810,6 +5832,10 @@ TabStripModel::PrepareTabsToMoveToIndex(const std::vector<int>& tab_indices,
+ }
+ 
+ void TabStripModel::SetTabsPinned(std::vector<int> indices, bool pinned) {
++  if (ArePinnedTabsFrozen()) {
++    return;
++  }
++
+   // `indices` are given in ascending order. If pinning, process the indices as
+   // is, since when moving the tab at `index` to the left, this will not change
+   // the tabs that are pointed to by indices larger than `index`. Similarly, if
+@@ -6132,6 +6158,22 @@ void TabStripModel::OnActiveTabChanged(
+   }
+ }
+ 
++bool TabStripModel::IsPinnedTabFrozen(const tabs::TabInterface* tab) const {
++  return tab && tab->IsPinned() && ArePinnedTabsFrozen();
++}
++
++bool TabStripModel::CommandTouchesFrozenPinnedTab(int context_index) const {
++  if (!ArePinnedTabsFrozen()) {
++    return false;
++  }
++  for (int index : GetIndicesForCommand(context_index)) {
++    if (IsTabPinned(index)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool TabStripModel::IsTabClosable(const tabs::TabInterface* tab) const {
+   if (!tab) {
+     return true;
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -521,6 +521,26 @@ class TabStripModel {
+   // processed, resulting in the split being unsplit.
+   void SetTabsPinned(const std::vector<int> indices, bool pinned);
+ 
++  // Helium: the PinnedTabsLocked policy freezes the pinned tabs of a window,
++  // see helium_pins::HeliumPinsService. While frozen, pinned tabs can't be
++  // unpinned, moved, dragged, split or sent to another window, and no tab can
++  // be pinned; closing a pin still hibernates it. The service sets the lock and
++  // makes its own changes inside a ScopedPinnedTabsUnlock, which unlocks every
++  // tab strip.
++  void SetPinnedTabsLocked(bool locked) { pinned_tabs_locked_ = locked; }
++  bool ArePinnedTabsFrozen() const {
++    return pinned_tabs_locked_ && pinned_tabs_unlock_depth_ == 0;
++  }
++  bool IsPinnedTabFrozen(const tabs::TabInterface* tab) const;
++
++  class ScopedPinnedTabsUnlock {
++   public:
++    ScopedPinnedTabsUnlock() { ++pinned_tabs_unlock_depth_; }
++    ScopedPinnedTabsUnlock(const ScopedPinnedTabsUnlock&) = delete;
++    ScopedPinnedTabsUnlock& operator=(const ScopedPinnedTabsUnlock&) = delete;
++    ~ScopedPinnedTabsUnlock() { --pinned_tabs_unlock_depth_; }
++  };
++
+   // Returns true if the tab at `index` is pinned.
+   // See description above class for details on pinned tabs.
+   bool IsTabPinned(int index) const;
+@@ -1518,6 +1538,11 @@ class TabStripModel {
+   // True if all tabs are currently being closed via CloseAllTabs.
+   bool closing_all_ = false;
+ 
++  // Helium: PinnedTabsLocked state, see SetPinnedTabsLocked().
++  bool CommandTouchesFrozenPinnedTab(int context_index) const;
++  bool pinned_tabs_locked_ = false;
++  static inline int pinned_tabs_unlock_depth_ = 0;
++
+   // This must be kept in sync with `contents_data_`.
+   tabs::TabStripModelSelectionState selection_model_;
+ 
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -40,6 +40,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(prefs::kHeliumVerticalRightAligned, false);
+   registry->RegisterListPref(prefs::kHeliumPolicyPinnedTabs);
+   registry->RegisterIntegerPref(prefs::kHeliumPinnedTabColumns, 0);
++  registry->RegisterBooleanPref(prefs::kHeliumPolicyPinnedTabsLocked, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenMode, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeSidebarPinned, false);
+   registry->RegisterBooleanPref(prefs::kHeliumZenModeTopChromePinned, false);
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -156,6 +156,25 @@ void TabDragHandler::InitializeDrag(
+     const ui::ListSelectionModel& original_selection_model,
+     const ui::LocatedEvent& event) {
+   ResetDragState();
++
++  // Helium: frozen pinned tabs (PinnedTabsLocked policy) can't be dragged,
++  // alone or along with other selected tabs.
++  if (node.type() == TabCollectionNode::Type::TAB) {
++    const tabs::TabInterface* source_tab =
++        std::get<tabs::ConstDanglingUntriagedTabInterface>(node.GetNodeData());
++    if (tab_strip_model_->IsPinnedTabFrozen(source_tab)) {
++      return;
++    }
++    for (int index : tab_strip_model_->selection_model()
++                         .GetListSelectionModel()
++                         .selected_indices()) {
++      if (tab_strip_model_->IsPinnedTabFrozen(
++              tab_strip_model_->GetTabAtIndex(index))) {
++        return;
++      }
++    }
++  }
++
+   drag_controller_ = std::make_unique<TabDragController>();
+ 
+   DragInitData drag_init_data;
+--- a/chrome/common/pref_names.h
++++ b/chrome/common/pref_names.h
+@@ -643,6 +643,11 @@ inline constexpr char kHeliumPolicyPinnedTabs[] = "helium.policy_pinned_tabs";
+ inline constexpr char kHeliumPinnedTabColumns[] =
+     "helium.browser.pinned_tab_columns";
+ 
++// A boolean pref (set by the PinnedTabsLocked policy): when true, the pins are
++// frozen to the PinnedTabs list, see helium_pins::HeliumPinsService.
++inline constexpr char kHeliumPolicyPinnedTabsLocked[] =
++    "helium.policy_pinned_tabs_locked";
++
+ // A boolean pref set to true if zen mode is enabled.
+ inline constexpr char kHeliumZenMode[] = "helium.browser.zen_mode";
+ 
+--- a/components/policy/resources/templates/policies.yaml
++++ b/components/policy/resources/templates/policies.yaml
+@@ -1498,6 +1498,7 @@ policies:
+   1497: HeliumLayout
+   1498: PinnedTabs
+   1499: HeliumPinnedTabColumns
++  1500: PinnedTabsLocked
+ 
+ atomic_groups:
+   1: Homepage
+--- a/components/policy/resources/templates/policy_definitions/Miscellaneous/PinnedTabs.yaml
++++ b/components/policy/resources/templates/policy_definitions/Miscellaneous/PinnedTabs.yaml
+@@ -2,7 +2,7 @@ caption: Pinned tabs
+ desc: |-
+   Keeps a list of URLs among the pinned tabs that <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> shares between all windows of a profile.
+ 
+-  When the browser starts, and whenever this policy changes, each URL whose host (ignoring a leading "www.") no pin has as its pinned URL is added as a pin, after the existing pins, and shows up hibernated in every window. Navigating inside such a pin doesn't add a duplicate. Users can still close (hibernate) or unpin these pins; an unpinned one comes back the next time the browser starts or the policy changes.
++  When the browser starts, and whenever this policy changes, each URL whose host (ignoring a leading "www.") no pin has as its pinned URL is added as a pin, after the existing pins, and shows up hibernated in every window. Navigating inside such a pin doesn't add a duplicate. Unless PinnedTabsLocked is enabled, users can still unpin these pins; an unpinned one comes back the next time the browser starts or the policy changes. Closing a pin hibernates it either way.
+ 
+   Incognito and guest windows are not affected.
+ 
+--- /dev/null
++++ b/components/policy/resources/templates/policy_definitions/Miscellaneous/PinnedTabsLocked.yaml
+@@ -0,0 +1,28 @@
++caption: Lock pinned tabs
++desc: |-
++  Freezes the pinned tabs of <ph name="PRODUCT_NAME">$1<ex>Google Chrome</ex></ph> to the PinnedTabs list.
++
++  If this policy is enabled, the pins shared by the windows of a profile are exactly the PinnedTabs URLs (one per host, ignoring a leading "www."), in that order. Users can't unpin, move, drag, split or move them to another window, or change their pinned URL; closing one only hibernates it. Users can't pin other tabs either, and pins that aren't in the PinnedTabs list (e.g. from an earlier session) become regular tabs.
++
++  If this policy is disabled or not set, pinned tabs behave as usual.
++
++  Incognito and guest windows are not affected.
++example_value: true
++features:
++  dynamic_refresh: true
++  per_profile: true
++items:
++- caption: Freeze the policy pinned tabs
++  value: true
++- caption: Let users manage pinned tabs
++  value: false
++owners:
++- file://components/policy/OWNERS
++schema:
++  type: boolean
++supported_on:
++- chrome.linux:156-
++- chrome.win:156-
++- chrome.mac:156-
++tags: []
++type: main
+--- /dev/null
++++ b/components/policy/test/data/pref_mapping/PinnedTabsLocked.json
+@@ -0,0 +1,15 @@
++[
++  {
++    "os": ["win", "linux", "mac"],
++    "policy_pref_mapping_tests": [
++      {
++        "policies": { "PinnedTabsLocked": true },
++        "prefs": { "helium.policy_pinned_tabs_locked": { "value": true } }
++      },
++      {
++        "policies": { "PinnedTabsLocked": false },
++        "prefs": { "helium.policy_pinned_tabs_locked": { "value": false } }
++      }
++    ]
++  }
++]
